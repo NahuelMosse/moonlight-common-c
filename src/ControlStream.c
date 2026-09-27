@@ -106,6 +106,10 @@ static bool encryptedControlStream;
 static bool hdrEnabled;
 static SS_HDR_METADATA hdrMetadata;
 
+// Last good frame at the last loss stats report, and frames fully received since then
+static uint32_t lossReportLastGoodFrame;
+static uint32_t lossReportGoodFrameCount;
+
 static int intervalGoodFrameCount;
 static int intervalTotalFrameCount;
 static uint64_t intervalStartTimeMs;
@@ -343,6 +347,8 @@ int initializeControlStream(void) {
 
     lastGoodFrame = 0;
     lastSeenFrame = 0;
+    lossReportLastGoodFrame = 0;
+    lossReportGoodFrameCount = 0;
     disconnectPending = false;
     intervalGoodFrameCount = 0;
     intervalTotalFrameCount = 0;
@@ -431,6 +437,7 @@ void connectionDetectedFrameLoss(uint32_t startFrame, uint32_t endFrame) {
 void connectionReceivedCompleteFrame(uint32_t frameIndex, bool frameIsLTR) {
     lastGoodFrame = frameIndex;
     intervalGoodFrameCount++;
+    lossReportGoodFrameCount++;
 
     if (frameIsLTR && IS_SUNSHINE() && isReferenceFrameInvalidationEnabled()) {
         // Queue LTR frame ACK control message
@@ -1385,17 +1392,59 @@ static void controlReceiveThreadFunc(void* context) {
     }
 }
 
+// Builds and sends a loss stats message: the frames lost since the last one, and the last frame
+// fully received. Returns false only if sending failed.
+static bool sendLossStats(char* payload, uint32_t lossCount) {
+    BYTE_BUFFER byteBuffer;
+
+    BbInitializeWrappedBuffer(&byteBuffer, payload, 0, payloadLengths[IDX_LOSS_STATS], BYTE_ORDER_LITTLE);
+    BbPut32(&byteBuffer, lossCount);
+    BbPut32(&byteBuffer, LOSS_REPORT_INTERVAL_MS);
+    BbPut32(&byteBuffer, 1000);
+    BbPut64(&byteBuffer, lastGoodFrame);
+    BbPut32(&byteBuffer, 0);
+    BbPut32(&byteBuffer, 0);
+    BbPut32(&byteBuffer, 0x14);
+
+    // Send the message (and don't expect a response)
+    return sendMessageAndForget(packetTypes[IDX_LOSS_STATS],
+                                payloadLengths[IDX_LOSS_STATS],
+                                payload,
+                                CTRL_CHANNEL_GENERIC,
+                                0,
+                                false);
+}
+
+// Frames lost since the last call. Frames complete in order, so every frame between two
+// consecutive last good frames that did not complete was lost.
+static uint32_t takeLossCountSinceLastReport(void) {
+    uint32_t goodFrame = lastGoodFrame;
+    uint32_t goodFrameCount = lossReportGoodFrameCount;
+    uint32_t lossCount = 0;
+
+    if (lossReportLastGoodFrame != 0 && goodFrame > lossReportLastGoodFrame) {
+        uint32_t framesPassed = goodFrame - lossReportLastGoodFrame;
+        lossCount = framesPassed > goodFrameCount ? framesPassed - goodFrameCount : 0;
+    }
+
+    lossReportLastGoodFrame = goodFrame;
+    lossReportGoodFrameCount -= goodFrameCount;
+    return lossCount;
+}
+
 static void lossStatsThreadFunc(void* context) {
     BYTE_BUFFER byteBuffer;
 
     if (usePeriodicPing) {
         char periodicPingPayload[8];
+        char lossStatsPayload[32];
+        uint64_t nextPingTimeMs = 0;
 
-        BbInitializeWrappedBuffer(&byteBuffer, periodicPingPayload, 0, sizeof(periodicPingPayload), BYTE_ORDER_LITTLE);
-        BbPut16(&byteBuffer, 4); // Length of payload
-        BbPut32(&byteBuffer, 0); // Timestamp?
+        LC_ASSERT(payloadLengths[IDX_LOSS_STATS] <= (short)sizeof(lossStatsPayload));
 
         while (!PltIsThreadInterrupted(&lossStatsThread)) {
+            uint64_t now;
+
             // For Sunshine servers, send the more detailed per-frame FEC messages
             if (IS_SUNSHINE()) {
                 PQUEUED_FRAME_FEC_STATUS queuedFrameStatus;
@@ -1419,27 +1468,48 @@ static void lossStatsThreadFunc(void* context) {
 
                     free(queuedFrameStatus);
                 }
+
+                // Sunshine also gets the periodic loss stats. Unlike the FEC status messages,
+                // which only come when a frame needed repair, these say every 50 ms how far the
+                // stream has arrived: the last good frame, and how many frames were lost.
+                if (!sendLossStats(lossStatsPayload, takeLossCountSinceLastReport())) {
+                    Limelog("Loss Stats: Transaction failed: %d\n", (int)LastSocketError());
+                    ListenerCallbacks.connectionTerminated(LastSocketFail());
+                    return;
+                }
             }
 
-            // Send the message (and don't expect a response)
-            //
-            // NB: We send this periodic message as reliable to ensure the RTT is recomputed
-            // regularly. This only happens when an ACK is received to a reliable packet.
-            // Since the other traffic on this channel is unsequenced, it doesn't really
-            // cause any negative HOL blocking side-effects.
-            if (!sendMessageAndForget(0x0200,
-                                      sizeof(periodicPingPayload),
-                                      periodicPingPayload,
-                                      CTRL_CHANNEL_GENERIC,
-                                      ENET_PACKET_FLAG_RELIABLE,
-                                      false)) {
-                Limelog("Loss Stats: Transaction failed: %d\n", (int)LastSocketError());
-                ListenerCallbacks.connectionTerminated(LastSocketFail());
-                return;
+            now = PltGetMillis();
+            if (now >= nextPingTimeMs) {
+                // The timestamp is the client's monotonic clock in milliseconds. Sunshine can
+                // follow the delay of the client to host direction with it; older hosts never
+                // read it, so it is only filled for Sunshine.
+                BbInitializeWrappedBuffer(&byteBuffer, periodicPingPayload, 0, sizeof(periodicPingPayload), BYTE_ORDER_LITTLE);
+                BbPut16(&byteBuffer, 4); // Length of payload
+                BbPut32(&byteBuffer, IS_SUNSHINE() ? (uint32_t)now : 0); // Timestamp
+
+                // Send the message (and don't expect a response)
+                //
+                // NB: We send this periodic message as reliable to ensure the RTT is recomputed
+                // regularly. This only happens when an ACK is received to a reliable packet.
+                // Since the other traffic on this channel is unsequenced, it doesn't really
+                // cause any negative HOL blocking side-effects.
+                if (!sendMessageAndForget(0x0200,
+                                          sizeof(periodicPingPayload),
+                                          periodicPingPayload,
+                                          CTRL_CHANNEL_GENERIC,
+                                          ENET_PACKET_FLAG_RELIABLE,
+                                          false)) {
+                    Limelog("Loss Stats: Transaction failed: %d\n", (int)LastSocketError());
+                    ListenerCallbacks.connectionTerminated(LastSocketFail());
+                    return;
+                }
+                nextPingTimeMs = now + PERIODIC_PING_INTERVAL_MS;
             }
 
             // Wait a bit
-            PltSleepMsInterruptible(&lossStatsThread, PERIODIC_PING_INTERVAL_MS);
+            PltSleepMsInterruptible(&lossStatsThread,
+                                    IS_SUNSHINE() ? LOSS_REPORT_INTERVAL_MS : PERIODIC_PING_INTERVAL_MS);
         }
     }
     else {
@@ -1456,23 +1526,8 @@ static void lossStatsThreadFunc(void* context) {
         }
 
         while (!PltIsThreadInterrupted(&lossStatsThread)) {
-            // Construct the payload
-            BbInitializeWrappedBuffer(&byteBuffer, lossStatsPayload, 0, payloadLengths[IDX_LOSS_STATS], BYTE_ORDER_LITTLE);
-            BbPut32(&byteBuffer, 0);
-            BbPut32(&byteBuffer, LOSS_REPORT_INTERVAL_MS);
-            BbPut32(&byteBuffer, 1000);
-            BbPut64(&byteBuffer, lastGoodFrame);
-            BbPut32(&byteBuffer, 0);
-            BbPut32(&byteBuffer, 0);
-            BbPut32(&byteBuffer, 0x14);
-
-            // Send the message (and don't expect a response)
-            if (!sendMessageAndForget(packetTypes[IDX_LOSS_STATS],
-                                      payloadLengths[IDX_LOSS_STATS],
-                                      lossStatsPayload,
-                                      CTRL_CHANNEL_GENERIC,
-                                      0,
-                                      false)) {
+            // Older hosts keep getting the loss count they always got
+            if (!sendLossStats(lossStatsPayload, 0)) {
                 free(lossStatsPayload);
                 Limelog("Loss Stats: Transaction failed: %d\n", (int)LastSocketError());
                 ListenerCallbacks.connectionTerminated(LastSocketFail());
