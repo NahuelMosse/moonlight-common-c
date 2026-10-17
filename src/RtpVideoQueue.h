@@ -47,6 +47,11 @@ typedef struct _RTP_VIDEO_QUEUE {
     uint64_t lastOosFramePresentationTimestamp;
     bool receivedOosData;
 
+    // Arrival of every packet of the most recent frame, whether or not it was needed to rebuild
+    // it. Reported in Frame Stats when the next frame starts arriving.
+    bool arrivalValid;
+    SS_FRAME_ARRIVAL arrival;
+
     RTP_VIDEO_STATS stats; // the above values are short-lived, this tracks stats for the life of the queue
 } RTP_VIDEO_QUEUE, *PRTP_VIDEO_QUEUE;
 

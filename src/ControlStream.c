@@ -43,6 +43,11 @@ typedef struct _QUEUED_FRAME_FEC_STATUS {
     LINKED_BLOCKING_QUEUE_ENTRY entry;
 } QUEUED_FRAME_FEC_STATUS, *PQUEUED_FRAME_FEC_STATUS;
 
+typedef struct _QUEUED_FRAME_ARRIVAL {
+    SS_FRAME_ARRIVAL arrival;
+    LINKED_BLOCKING_QUEUE_ENTRY entry;
+} QUEUED_FRAME_ARRIVAL, *PQUEUED_FRAME_ARRIVAL;
+
 typedef struct _QUEUED_ASYNC_CALLBACK {
     int typeIndex;
     union {
@@ -120,6 +125,7 @@ static uint64_t firstFrameTimeMs;
 
 static LINKED_BLOCKING_QUEUE referenceFrameControlQueue;
 static LINKED_BLOCKING_QUEUE frameFecStatusQueue;
+static LINKED_BLOCKING_QUEUE frameArrivalQueue;
 static LINKED_BLOCKING_QUEUE asyncCallbackQueue;
 static PLT_EVENT idrFrameRequiredEvent;
 
@@ -136,6 +142,7 @@ static PPLT_CRYPTO_CONTEXT decryptionCtx;
 #define IDX_START_B 1
 #define IDX_INVALIDATE_REF_FRAMES 2
 #define IDX_LOSS_STATS 3
+#define IDX_FRAME_STATS 4
 #define IDX_INPUT_DATA 5
 #define IDX_RUMBLE_DATA 6
 #define IDX_TERMINATION 7
@@ -181,7 +188,7 @@ static const short packetTypesGen5[] = {
     0x0307, // Start B
     0x0301, // Invalidate reference frames
     0x0201, // Loss Stats
-    0x0204, // Frame Stats (unused)
+    0x0204, // Frame Stats (sent only to Sunshine)
     0x0207, // Input data
     -1,     // Rumble data (unused)
     -1,     // Termination (unused)
@@ -195,7 +202,7 @@ static const short packetTypesGen7[] = {
     0x0307, // Start B
     0x0301, // Invalidate reference frames
     0x0201, // Loss Stats
-    0x0204, // Frame Stats (unused)
+    0x0204, // Frame Stats (sent only to Sunshine)
     0x0206, // Input data
     0x010b, // Rumble data
     0x0100, // Termination
@@ -209,7 +216,7 @@ static const short packetTypesGen7Enc[] = {
     0x0307, // Start B
     0x0301, // Invalidate reference frames
     0x0201, // Loss Stats
-    0x0204, // Frame Stats (unused)
+    0x0204, // Frame Stats (sent only to Sunshine)
     0x0206, // Input data
     0x010b, // Rumble data
     0x0109, // Termination (extended)
@@ -307,6 +314,7 @@ int initializeControlStream(void) {
     PltCreateEvent(&idrFrameRequiredEvent);
     LbqInitializeLinkedBlockingQueue(&referenceFrameControlQueue, 20);
     LbqInitializeLinkedBlockingQueue(&frameFecStatusQueue, 8); // Limits number of frame status reports per periodic ping interval
+    LbqInitializeLinkedBlockingQueue(&frameArrivalQueue, 24); // Two loss report intervals at 240 FPS
     LbqInitializeLinkedBlockingQueue(&asyncCallbackQueue, 30);
     PltCreateMutex(&enetMutex);
 
@@ -384,6 +392,7 @@ void destroyControlStream(void) {
     PltCloseEvent(&idrFrameRequiredEvent);
     freeBasicLbqList(LbqDestroyLinkedBlockingQueue(&referenceFrameControlQueue));
     freeBasicLbqList(LbqDestroyLinkedBlockingQueue(&frameFecStatusQueue));
+    freeBasicLbqList(LbqDestroyLinkedBlockingQueue(&frameArrivalQueue));
     freeBasicLbqList(LbqDestroyLinkedBlockingQueue(&asyncCallbackQueue));
 
     PltDeleteMutex(&enetMutex);
@@ -471,6 +480,23 @@ void connectionSendFrameFecStatus(PSS_FRAME_FEC_STATUS fecStatus) {
         queuedFecStatus->fecStatus = *fecStatus;
         if (LbqOfferQueueItem(&frameFecStatusQueue, queuedFecStatus, &queuedFecStatus->entry) == LBQ_BOUND_EXCEEDED) {
             free(queuedFecStatus);
+        }
+    }
+}
+
+void connectionObserveFrameArrival(PSS_FRAME_ARRIVAL arrival) {
+    // Only Sunshine hosts get Frame Stats: older ones never had a use for the message
+    if (!IS_SUNSHINE()) {
+        return;
+    }
+
+    // Best-effort, like the FEC status: if the queue is full the host gets one sample fewer,
+    // which its estimator already tolerates
+    PQUEUED_FRAME_ARRIVAL queuedArrival = malloc(sizeof(*queuedArrival));
+    if (queuedArrival != NULL) {
+        queuedArrival->arrival = *arrival;
+        if (LbqOfferQueueItem(&frameArrivalQueue, queuedArrival, &queuedArrival->entry) == LBQ_BOUND_EXCEEDED) {
+            free(queuedArrival);
         }
     }
 }
@@ -1415,6 +1441,52 @@ static bool sendLossStats(char* payload, uint32_t lossCount) {
                                 false);
 }
 
+// Packs the arrival of every frame received since the last call into as few Frame Stats messages
+// as the payload length of this generation allows. Returns false only if sending failed.
+static bool sendQueuedFrameStats(void) {
+    char payload[128];
+    short length = payloadLengths[IDX_FRAME_STATS];
+    int perMessage = (length - SS_FRAME_STATS_HEADER_SIZE) / SS_FRAME_STATS_ENTRY_SIZE;
+    PQUEUED_FRAME_ARRIVAL queuedArrival;
+
+    if (packetTypes[IDX_FRAME_STATS] < 0 || length <= 0 || length > (short)sizeof(payload) || perMessage <= 0) {
+        // Drop what was queued: this generation has no Frame Stats message to carry it
+        while (LbqPollQueueElement(&frameArrivalQueue, (void**)&queuedArrival) == LBQ_SUCCESS) {
+            free(queuedArrival);
+        }
+        return true;
+    }
+
+    while (LbqGetItemCount(&frameArrivalQueue) > 0) {
+        BYTE_BUFFER byteBuffer;
+        int count = 0;
+
+        memset(payload, 0, length);
+        BbInitializeWrappedBuffer(&byteBuffer, payload, SS_FRAME_STATS_HEADER_SIZE, length - SS_FRAME_STATS_HEADER_SIZE, BYTE_ORDER_BIG);
+        while (count < perMessage && LbqPollQueueElement(&frameArrivalQueue, (void**)&queuedArrival) == LBQ_SUCCESS) {
+            BbPut32(&byteBuffer, queuedArrival->arrival.frameIndex);
+            BbPut32(&byteBuffer, queuedArrival->arrival.firstPacketRecvTimeUs);
+            BbPut32(&byteBuffer, queuedArrival->arrival.lastPacketRecvTimeUs);
+            BbPut32(&byteBuffer, queuedArrival->arrival.bytesReceived);
+            BbPut16(&byteBuffer, queuedArrival->arrival.packetsReceived);
+            free(queuedArrival);
+            count++;
+        }
+        if (count == 0) {
+            break;
+        }
+        payload[0] = (char)count;
+
+        // Unreliable, like the FEC status: a lost report is one sample fewer
+        if (!sendMessageEnet(packetTypes[IDX_FRAME_STATS], length, payload,
+                             CTRL_CHANNEL_GENERIC, ENET_PACKET_FLAG_UNSEQUENCED,
+                             LbqGetItemCount(&frameArrivalQueue) > 0)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Frames lost since the last call. Frames complete in order, so every frame between two
 // consecutive last good frames that did not complete was lost.
 static uint32_t takeLossCountSinceLastReport(void) {
@@ -1467,6 +1539,13 @@ static void lossStatsThreadFunc(void* context) {
                     }
 
                     free(queuedFrameStatus);
+                }
+
+                // And when each frame arrived, in Frame Stats
+                if (!sendQueuedFrameStats()) {
+                    Limelog("Loss Stats: Sending frame stats message failed: %d\n", (int)LastSocketError());
+                    ListenerCallbacks.connectionTerminated(LastSocketFail());
+                    return;
                 }
 
                 // Sunshine also gets the periodic loss stats. Unlike the FEC status messages,
@@ -1699,6 +1778,7 @@ int stopControlStream(void) {
     stopping = true;
     LbqSignalQueueShutdown(&referenceFrameControlQueue);
     LbqSignalQueueShutdown(&frameFecStatusQueue);
+    LbqSignalQueueShutdown(&frameArrivalQueue);
     LbqSignalQueueDrain(&asyncCallbackQueue);
     PltSetEvent(&idrFrameRequiredEvent);
 
