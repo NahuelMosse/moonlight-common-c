@@ -188,7 +188,7 @@ static const short packetTypesGen5[] = {
     0x0307, // Start B
     0x0301, // Invalidate reference frames
     0x0201, // Loss Stats
-    0x0204, // Frame Stats (unused)
+    0x0204, // Frame Stats (sent only to Sunshine)
     0x0207, // Input data
     -1,     // Rumble data (unused)
     -1,     // Termination (unused)
@@ -202,7 +202,7 @@ static const short packetTypesGen7[] = {
     0x0307, // Start B
     0x0301, // Invalidate reference frames
     0x0201, // Loss Stats
-    0x0204, // Frame Stats (unused)
+    0x0204, // Frame Stats (sent only to Sunshine)
     0x0206, // Input data
     0x010b, // Rumble data
     0x0100, // Termination
@@ -216,7 +216,7 @@ static const short packetTypesGen7Enc[] = {
     0x0307, // Start B
     0x0301, // Invalidate reference frames
     0x0201, // Loss Stats
-    0x0204, // Frame Stats (unused)
+    0x0204, // Frame Stats (sent only to Sunshine)
     0x0206, // Input data
     0x010b, // Rumble data
     0x0109, // Termination (extended)
