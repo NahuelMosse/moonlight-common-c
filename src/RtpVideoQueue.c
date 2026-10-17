@@ -541,7 +541,50 @@ uint32_t RtpvGetCurrentFrameNumber(PRTP_VIDEO_QUEUE queue) {
     return queue->currentFrameNumber;
 }
 
+// Accounts one packet into the arrival of its frame. Every packet counts, parity and surplus
+// included: what matters is how the bottleneck spread the frame out, not which packets the
+// decoder ended up using.
+static void observeArrivalPacket(PRTP_VIDEO_QUEUE queue, uint32_t frameIndex, int length) {
+    uint32_t nowUs = (uint32_t)PltGetMicroseconds();
+
+    // A late packet of a frame whose arrival was already reported cannot reopen it
+    if (queue->arrivalValid && isBefore32(frameIndex, queue->arrival.frameIndex)) {
+        return;
+    }
+
+    if (queue->arrivalValid && queue->arrival.frameIndex != frameIndex) {
+        // Reported even with a single packet: it has no dispersion, but the host still needs it
+        // to tell a small frame apart from a lost one
+        connectionObserveFrameArrival(&queue->arrival);
+        queue->arrivalValid = false;
+    }
+
+    if (!queue->arrivalValid) {
+        memset(&queue->arrival, 0, sizeof(queue->arrival));
+        queue->arrival.frameIndex = frameIndex;
+        queue->arrival.firstPacketRecvTimeUs = nowUs;
+        queue->arrivalValid = true;
+    }
+
+    queue->arrival.lastPacketRecvTimeUs = nowUs;
+    queue->arrival.bytesReceived += (uint32_t)length;
+    if (queue->arrival.packetsReceived < UINT16_MAX) {
+        queue->arrival.packetsReceived++;
+    }
+}
+
 int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_QUEUE_ENTRY packetEntry) {
+    // Into the arrival of its frame before any check below can throw the packet away. Once a
+    // frame can be rebuilt the queue moves its window past it, and the parity still on its way is
+    // rejected as behind: it crossed the bottleneck all the same.
+    {
+        int arrivalOffset = sizeof(*packet) + ((packet->header & FLAG_EXTENSION) ? 4 : 0);
+        if (length >= arrivalOffset + (int)sizeof(NV_VIDEO_PACKET)) {
+            PNV_VIDEO_PACKET arrivalPacket = (PNV_VIDEO_PACKET)(((char*)packet) + arrivalOffset);
+            observeArrivalPacket(queue, LE32(arrivalPacket->frameIndex), length);
+        }
+    }
+
     if (isBefore16(packet->sequenceNumber, queue->nextContiguousSequenceNumber)) {
         // Reject packets behind our current buffer window
         return RTPF_RET_REJECTED;
