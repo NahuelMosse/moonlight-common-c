@@ -205,7 +205,7 @@ static const short packetTypesGen5[] = {
     0x0307, // Start B
     0x0301, // Invalidate reference frames
     0x0201, // Loss Stats
-    0x0204, // Frame Stats (sent only to Sunshine)
+    0x0204, // Frame Stats (sent only to hosts with SS_FF_ADAPTIVE_BITRATE)
     0x0207, // Input data
     -1,     // Rumble data (unused)
     -1,     // Termination (unused)
@@ -220,7 +220,7 @@ static const short packetTypesGen7[] = {
     0x0307, // Start B
     0x0301, // Invalidate reference frames
     0x0201, // Loss Stats
-    0x0204, // Frame Stats (sent only to Sunshine)
+    0x0204, // Frame Stats (sent only to hosts with SS_FF_ADAPTIVE_BITRATE)
     0x0206, // Input data
     0x010b, // Rumble data
     0x0100, // Termination
@@ -235,7 +235,7 @@ static const short packetTypesGen7Enc[] = {
     0x0307, // Start B
     0x0301, // Invalidate reference frames
     0x0201, // Loss Stats
-    0x0204, // Frame Stats (sent only to Sunshine)
+    0x0204, // Frame Stats (sent only to hosts with SS_FF_ADAPTIVE_BITRATE)
     0x0206, // Input data
     0x010b, // Rumble data
     0x0109, // Termination (extended)
@@ -326,6 +326,12 @@ static bool supportsIdrFrameRequest;
 
 #define LOSS_REPORT_INTERVAL_MS 50
 #define PERIODIC_PING_INTERVAL_MS 100
+
+// Frame Stats, the loss summary and the ping clock only go to hosts that advertise they use them
+// (SS_FF_ADAPTIVE_BITRATE); every other host gets the messages it always got.
+static bool hostUsesAdaptiveSignals(void) {
+    return IS_SUNSHINE() && (SunshineFeatureFlags & SS_FF_ADAPTIVE_BITRATE);
+}
 
 // Initializes the control stream
 int initializeControlStream(void) {
@@ -472,8 +478,8 @@ void connectionReceivedCompleteFrame(uint32_t frameIndex, bool frameIsLTR) {
     lastGoodFrame = frameIndex;
     intervalGoodFrameCount++;
 
-    // Only Sunshine hosts get the loss count built from these
-    if (IS_SUNSHINE()) {
+    // Only hosts that use the loss summary get the loss count built from these
+    if (hostUsesAdaptiveSignals()) {
         PltLockMutex(&lossReportMutex);
         lossReportNewestGoodFrame = frameIndex;
         lossReportGoodFrameCount++;
@@ -521,8 +527,8 @@ void connectionSendFrameFecStatus(PSS_FRAME_FEC_STATUS fecStatus) {
 }
 
 void connectionObserveFrameArrival(PSS_FRAME_ARRIVAL arrival) {
-    // Only Sunshine hosts get Frame Stats: older ones never had a use for the message
-    if (!IS_SUNSHINE()) {
+    // Only hosts that use Frame Stats get them: the others never had a use for the message
+    if (!hostUsesAdaptiveSignals()) {
         return;
     }
 
@@ -1736,6 +1742,7 @@ static void lossStatsThreadFunc(void* context) {
         char periodicPingPayload[8];
         char lossStatsPayload[32];
         uint64_t nextPingTimeMs = 0;
+        bool adaptiveSignals = hostUsesAdaptiveSignals();
 
         LC_ASSERT(payloadLengths[IDX_LOSS_STATS] <= (short)sizeof(lossStatsPayload));
 
@@ -1767,16 +1774,16 @@ static void lossStatsThreadFunc(void* context) {
                 }
 
                 // And when each frame arrived, in Frame Stats
-                if (!sendQueuedFrameStats()) {
+                if (adaptiveSignals && !sendQueuedFrameStats()) {
                     Limelog("Loss Stats: Sending frame stats message failed: %d\n", (int)LastSocketError());
                     ListenerCallbacks.connectionTerminated(LastSocketFail());
                     return;
                 }
 
-                // Sunshine also gets the periodic loss stats. Unlike the FEC status messages,
-                // which only come when a frame needed repair, these say every 50 ms how far the
-                // stream has arrived: the last good frame, and how many frames were lost.
-                if (!sendLossStats(lossStatsPayload, takeLossCountSinceLastReport())) {
+                // A host that uses them also gets the periodic loss stats. Unlike the FEC status
+                // messages, which only come when a frame needed repair, these say every 50 ms how
+                // far the stream has arrived: the last good frame, and how many frames were lost.
+                if (adaptiveSignals && !sendLossStats(lossStatsPayload, takeLossCountSinceLastReport())) {
                     Limelog("Loss Stats: Transaction failed: %d\n", (int)LastSocketError());
                     ListenerCallbacks.connectionTerminated(LastSocketFail());
                     return;
@@ -1784,13 +1791,13 @@ static void lossStatsThreadFunc(void* context) {
             }
 
             now = PltGetMillis();
-            if (now >= nextPingTimeMs) {
-                // The timestamp is the client's monotonic clock in milliseconds. Sunshine can
-                // follow the delay of the client to host direction with it; older hosts never
-                // read it, so it is only filled for Sunshine.
+            if (!adaptiveSignals || now >= nextPingTimeMs) {
+                // The timestamp is the client's monotonic clock in milliseconds. A host that uses
+                // it follows the delay of the client to host direction with it; the others never
+                // read it, so it is only filled for them.
                 BbInitializeWrappedBuffer(&byteBuffer, periodicPingPayload, 0, sizeof(periodicPingPayload), BYTE_ORDER_LITTLE);
                 BbPut32(&byteBuffer, 4); // Length of payload
-                BbPut32(&byteBuffer, IS_SUNSHINE() ? (uint32_t)now : 0); // Timestamp
+                BbPut32(&byteBuffer, adaptiveSignals ? (uint32_t)now : 0); // Timestamp
 
                 // Send the message (and don't expect a response)
                 //
@@ -1813,7 +1820,7 @@ static void lossStatsThreadFunc(void* context) {
 
             // Wait a bit
             PltSleepMsInterruptible(&lossStatsThread,
-                                    IS_SUNSHINE() ? LOSS_REPORT_INTERVAL_MS : PERIODIC_PING_INTERVAL_MS);
+                                    adaptiveSignals ? LOSS_REPORT_INTERVAL_MS : PERIODIC_PING_INTERVAL_MS);
         }
     }
     else {
