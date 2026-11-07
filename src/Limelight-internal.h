@@ -86,6 +86,10 @@ extern uint32_t EncryptionFeaturesEnabled;
 // Client feature flags for x-ml-general.featureFlags SDP attribute
 #define ML_FF_FEC_STATUS 0x01 // Client sends SS_FRAME_FEC_STATUS for frame losses
 #define ML_FF_SESSION_ID_V1 0x02 // Client supports X-SS-Ping-Payload and X-SS-Connect-Data
+#define ML_FF_ADAPTIVE_SIGNALS 0x04 // Client sends Frame Stats arrival times, the loss summary and its clock in the periodic ping
+
+// Host feature flags for x-ss-general.featureFlags SDP attribute (the public ones are LI_FF_*)
+#define SS_FF_ADAPTIVE_BITRATE 0x04 // Host adapts the bitrate to the client's Frame Stats, loss summary and ping clock
 
 #define UDP_RECV_POLL_TIMEOUT_MS 100
 
