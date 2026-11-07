@@ -531,7 +531,8 @@ void connectionObserveFrameArrival(PSS_FRAME_ARRIVAL arrival) {
     PQUEUED_FRAME_ARRIVAL queuedArrival = malloc(sizeof(*queuedArrival));
     if (queuedArrival != NULL) {
         queuedArrival->arrival = *arrival;
-        if (LbqOfferQueueItem(&frameArrivalQueue, queuedArrival, &queuedArrival->entry) == LBQ_BOUND_EXCEEDED) {
+        // Full queue or shutting down: either way nobody will take this entry
+        if (LbqOfferQueueItem(&frameArrivalQueue, queuedArrival, &queuedArrival->entry) != LBQ_SUCCESS) {
             free(queuedArrival);
         }
     }
