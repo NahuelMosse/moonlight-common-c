@@ -117,8 +117,12 @@ static bool encryptedControlStream;
 static bool hdrEnabled;
 static SS_HDR_METADATA hdrMetadata;
 
-// Last good frame at the last loss stats report, and frames fully received since then
+// Last good frame at the last loss stats report, and the newest good frame and frames fully
+// received since then. The video thread updates the last two and the loss stats thread takes
+// them, so both go together under lossReportMutex.
+static PLT_MUTEX lossReportMutex;
 static uint32_t lossReportLastGoodFrame;
+static uint32_t lossReportNewestGoodFrame;
 static uint32_t lossReportGoodFrameCount;
 
 static int intervalGoodFrameCount;
@@ -324,6 +328,7 @@ int initializeControlStream(void) {
     LbqInitializeLinkedBlockingQueue(&frameFecStatusQueue, 8); // Limits number of frame status reports per periodic ping interval
     LbqInitializeLinkedBlockingQueue(&asyncCallbackQueue, 30);
     PltCreateMutex(&enetMutex);
+    PltCreateMutex(&lossReportMutex);
 
     encryptedControlStream = APP_VERSION_AT_LEAST(7, 1, 431);
 
@@ -363,6 +368,7 @@ int initializeControlStream(void) {
     lastGoodFrame = 0;
     lastSeenFrame = 0;
     lossReportLastGoodFrame = 0;
+    lossReportNewestGoodFrame = 0;
     lossReportGoodFrameCount = 0;
     disconnectPending = false;
     intervalGoodFrameCount = 0;
@@ -402,6 +408,7 @@ void destroyControlStream(void) {
     freeBasicLbqList(LbqDestroyLinkedBlockingQueue(&asyncCallbackQueue));
 
     PltDeleteMutex(&enetMutex);
+    PltDeleteMutex(&lossReportMutex);
 }
 
 static void queueFrameInvalidationTuple(uint32_t startFrame, uint32_t endFrame) {
@@ -452,7 +459,14 @@ void connectionDetectedFrameLoss(uint32_t startFrame, uint32_t endFrame) {
 void connectionReceivedCompleteFrame(uint32_t frameIndex, bool frameIsLTR) {
     lastGoodFrame = frameIndex;
     intervalGoodFrameCount++;
-    lossReportGoodFrameCount++;
+
+    // Only Sunshine hosts get the loss count built from these
+    if (IS_SUNSHINE()) {
+        PltLockMutex(&lossReportMutex);
+        lossReportNewestGoodFrame = frameIndex;
+        lossReportGoodFrameCount++;
+        PltUnlockMutex(&lossReportMutex);
+    }
 
     if (frameIsLTR && IS_SUNSHINE() && isReferenceFrameInvalidationEnabled()) {
         // Queue LTR frame ACK control message
@@ -1616,9 +1630,15 @@ static bool sendLossStats(char* payload, uint32_t lossCount) {
 // Frames lost since the last call. Frames complete in order, so every frame between two
 // consecutive last good frames that did not complete was lost.
 static uint32_t takeLossCountSinceLastReport(void) {
-    uint32_t goodFrame = lastGoodFrame;
-    uint32_t goodFrameCount = lossReportGoodFrameCount;
+    uint32_t goodFrame;
+    uint32_t goodFrameCount;
     uint32_t lossCount = 0;
+
+    PltLockMutex(&lossReportMutex);
+    goodFrame = lossReportNewestGoodFrame;
+    goodFrameCount = lossReportGoodFrameCount;
+    lossReportGoodFrameCount = 0;
+    PltUnlockMutex(&lossReportMutex);
 
     if (lossReportLastGoodFrame != 0 && goodFrame > lossReportLastGoodFrame) {
         uint32_t framesPassed = goodFrame - lossReportLastGoodFrame;
@@ -1626,7 +1646,6 @@ static uint32_t takeLossCountSinceLastReport(void) {
     }
 
     lossReportLastGoodFrame = goodFrame;
-    lossReportGoodFrameCount -= goodFrameCount;
     return lossCount;
 }
 
