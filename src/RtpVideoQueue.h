@@ -60,6 +60,7 @@ typedef struct _RTP_VIDEO_QUEUE {
 
 void RtpvInitializeQueue(PRTP_VIDEO_QUEUE queue);
 void RtpvCleanupQueue(PRTP_VIDEO_QUEUE queue);
-int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_QUEUE_ENTRY packetEntry);
+// arrivalUs is when the packet reached the machine (PltGetMicroseconds() timebase), or 0 if unknown
+int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_QUEUE_ENTRY packetEntry, uint64_t arrivalUs);
 uint32_t RtpvGetCurrentFrameNumber(PRTP_VIDEO_QUEUE queue);
 void RtpvSubmitQueuedPackets(PRTP_VIDEO_QUEUE queue);
