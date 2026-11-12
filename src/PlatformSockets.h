@@ -130,6 +130,12 @@ int enableNoDelay(SOCKET s);
 int setSocketNonBlocking(SOCKET s, bool enabled);
 int recvUdpSocket(SOCKET s, char* buffer, int size, bool useSelect,
                   struct sockaddr_storage* remoteAddr, SOCKADDR_LEN* addrLen);
+// Same as recvUdpSocket(), plus the kernel receive time of the packet in the PltGetMicroseconds()
+// timebase in *arrivalUs, or 0 if it has none (enableRxTimestamps() not called or unsupported)
+int recvUdpSocketStamped(SOCKET s, char* buffer, int size, bool useSelect,
+                         struct sockaddr_storage* remoteAddr, SOCKADDR_LEN* addrLen,
+                         uint64_t* arrivalUs);
+bool enableRxTimestamps(SOCKET s);
 void shutdownTcpSocket(SOCKET s);
 int setNonFatalRecvTimeoutMs(SOCKET s, int timeoutMs);
 void closeSocket(SOCKET s);

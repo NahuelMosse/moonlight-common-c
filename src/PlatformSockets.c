@@ -179,8 +179,116 @@ bool isSocketReadable(SOCKET s) {
     return true;
 }
 
+// Kernel receive timestamps: the stamp is taken when the driver hands the packet to the stack,
+// so a receive thread that was descheduled does not compress the arrival times it observes.
+// Windows and the other platforms keep stamping when the thread reads the packet.
+#if defined(__linux__) && defined(SO_TIMESTAMPNS)
+#define LC_RX_STAMPS
+#define LC_RX_STAMP_OPT SO_TIMESTAMPNS
+#define LC_RX_STAMP_CMSG SCM_TIMESTAMPNS
+typedef struct timespec LC_RX_STAMP;
+#define LC_RX_STAMP_NSEC(x) ((x).tv_nsec)
+#elif defined(__APPLE__) && defined(SO_TIMESTAMP)
+#define LC_RX_STAMPS
+#define LC_RX_STAMP_OPT SO_TIMESTAMP
+#define LC_RX_STAMP_CMSG SCM_TIMESTAMP
+typedef struct timeval LC_RX_STAMP;
+#define LC_RX_STAMP_NSEC(x) ((x).tv_usec * 1000)
+#endif
+
+// A packet older than this is not credible: the wall clock stepped between stamp and read
+#define RX_STAMP_MAX_AGE_US 1000000
+
+bool enableRxTimestamps(SOCKET s) {
+#ifdef LC_RX_STAMPS
+    int val = 1;
+    return setsockopt(s, SOL_SOCKET, LC_RX_STAMP_OPT, (char*)&val, sizeof(val)) == 0;
+#else
+    (void)s;
+    return false;
+#endif
+}
+
+#ifdef LC_RX_STAMPS
+// Receives one datagram and, if the kernel stamped it, converts the stamp to the PltGetMicroseconds()
+// timebase as now - age. *arrivalUs is 0 when there is no usable stamp.
+static int recvPacketStamped(SOCKET s, char* buffer, int size, struct sockaddr_storage* remoteAddr,
+                             SOCKADDR_LEN* addrLen, uint64_t* arrivalUs) {
+    union {
+        struct cmsghdr align;
+        char buf[CMSG_SPACE(sizeof(LC_RX_STAMP))];
+    } control;
+    struct iovec iov;
+    struct msghdr msg;
+    struct cmsghdr* cmsg;
+    int err;
+
+    *arrivalUs = 0;
+
+    iov.iov_base = buffer;
+    iov.iov_len = size;
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_name = remoteAddr;
+    msg.msg_namelen = addrLen != NULL ? *addrLen : 0;
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.buf;
+    msg.msg_controllen = sizeof(control.buf);
+
+    err = (int)recvmsg(s, &msg, 0);
+    if (err < 0) {
+        return err;
+    }
+    if (addrLen != NULL) {
+        *addrLen = msg.msg_namelen;
+    }
+
+    for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == LC_RX_STAMP_CMSG &&
+                cmsg->cmsg_len >= CMSG_LEN(sizeof(LC_RX_STAMP))) {
+            LC_RX_STAMP stamp;
+            struct timespec now;
+            int64_t ageUs;
+
+            memcpy(&stamp, CMSG_DATA(cmsg), sizeof(stamp));
+            clock_gettime(CLOCK_REALTIME, &now);
+            ageUs = ((int64_t)now.tv_sec - (int64_t)stamp.tv_sec) * 1000000 +
+                    ((int64_t)now.tv_nsec - (int64_t)LC_RX_STAMP_NSEC(stamp)) / 1000;
+            if (ageUs >= 0 && ageUs <= RX_STAMP_MAX_AGE_US) {
+                uint64_t nowUs = PltGetMicroseconds();
+                if (nowUs >= (uint64_t)ageUs) {
+                    *arrivalUs = nowUs - (uint64_t)ageUs;
+                }
+            }
+            break;
+        }
+    }
+
+    return err;
+}
+#endif
+
+static int recvPacket(SOCKET s, char* buffer, int size, struct sockaddr_storage* remoteAddr,
+                      SOCKADDR_LEN* addrLen, uint64_t* arrivalUs) {
+#ifdef LC_RX_STAMPS
+    if (arrivalUs != NULL) {
+        return recvPacketStamped(s, buffer, size, remoteAddr, addrLen, arrivalUs);
+    }
+#endif
+    if (arrivalUs != NULL) {
+        *arrivalUs = 0;
+    }
+    return (int)recvfrom(s, buffer, size, 0, (struct sockaddr*)remoteAddr, addrLen);
+}
+
 int recvUdpSocket(SOCKET s, char* buffer, int size, bool useSelect,
                   struct sockaddr_storage* remoteAddr, SOCKADDR_LEN* addrLen) {
+    return recvUdpSocketStamped(s, buffer, size, useSelect, remoteAddr, addrLen, NULL);
+}
+
+int recvUdpSocketStamped(SOCKET s, char* buffer, int size, bool useSelect,
+                         struct sockaddr_storage* remoteAddr, SOCKADDR_LEN* addrLen,
+                         uint64_t* arrivalUs) {
     int err;
 
     do {
@@ -197,13 +305,13 @@ int recvUdpSocket(SOCKET s, char* buffer, int size, bool useSelect,
             }
 
             // This won't block since the socket is readable
-            err = (int)recvfrom(s, buffer, size, 0, (struct sockaddr*)remoteAddr, addrLen);
+            err = recvPacket(s, buffer, size, remoteAddr, addrLen, arrivalUs);
         }
         else {
             // The caller has already configured a timeout on this
             // socket via SO_RCVTIMEO, so we can avoid a syscall
             // for each packet.
-            err = (int)recvfrom(s, buffer, size, 0, (struct sockaddr*)remoteAddr, addrLen);
+            err = recvPacket(s, buffer, size, remoteAddr, addrLen, arrivalUs);
             if (err < 0 &&
                     (LastSocketError() == EWOULDBLOCK ||
                      LastSocketError() == EINTR ||

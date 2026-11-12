@@ -89,6 +89,8 @@ static void VideoReceiveThreadProc(void* context) {
     char* encryptedBuffer;
     int queueStatus;
     bool useSelect;
+    bool stampsEnabled;
+    uint64_t arrivalUs;
     int waitingForVideoMs;
     bool encrypted;
     bool skipBehindBeforeDecrypt;
@@ -102,6 +104,10 @@ static void VideoReceiveThreadProc(void* context) {
     receiveSize = decryptedSize + ((EncryptionFeaturesEnabled & SS_ENC_VIDEO) ? sizeof(ENC_VIDEO_HEADER) : 0);
     bufferSize = decryptedSize + sizeof(RTPV_QUEUE_ENTRY);
     buffer = NULL;
+
+    // Only Frame Stats read the kernel receive time
+    stampsEnabled = connectionReportsFrameArrival() && enableRxTimestamps(rtpSocket);
+    Limelog("Video arrival stamps: %s\n", stampsEnabled ? "kernel" : "thread");
 
     if (setNonFatalRecvTimeoutMs(rtpSocket, UDP_RECV_POLL_TIMEOUT_MS) < 0) {
         // SO_RCVTIMEO failed, so use select() to wait
@@ -138,12 +144,14 @@ static void VideoReceiveThreadProc(void* context) {
             }
         }
 
-        err = recvUdpSocket(rtpSocket,
-                            encrypted ? encryptedBuffer : buffer,
-                            receiveSize,
-                            useSelect,
-                            NULL,
-                            NULL);
+        arrivalUs = 0;
+        err = recvUdpSocketStamped(rtpSocket,
+                                   encrypted ? encryptedBuffer : buffer,
+                                   receiveSize,
+                                   useSelect,
+                                   NULL,
+                                   NULL,
+                                   stampsEnabled ? &arrivalUs : NULL);
         if (err < 0) {
             Limelog("Video Receive: recvUdpSocket() failed: %d\n", (int)LastSocketError());
             ListenerCallbacks.connectionTerminated(LastSocketFail());
@@ -234,7 +242,7 @@ static void VideoReceiveThreadProc(void* context) {
         packet->timestamp = BE32(packet->timestamp);
         packet->ssrc = BE32(packet->ssrc);
 
-        queueStatus = RtpvAddPacket(&rtpQueue, packet, err, (PRTPV_QUEUE_ENTRY)&buffer[decryptedSize]);
+        queueStatus = RtpvAddPacket(&rtpQueue, packet, err, (PRTPV_QUEUE_ENTRY)&buffer[decryptedSize], arrivalUs);
 
         if (queueStatus == RTPF_RET_QUEUED) {
             // The queue owns the buffer
