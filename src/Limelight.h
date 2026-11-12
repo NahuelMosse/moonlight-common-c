@@ -1013,6 +1013,7 @@ void LiRequestIdrFrame(void);
 // This function returns any extended feature flags supported by the host.
 #define LI_FF_PEN_TOUCH_EVENTS        0x01 // LiSendTouchEvent()/LiSendPenEvent() supported
 #define LI_FF_CONTROLLER_TOUCH_EVENTS 0x02 // LiSendControllerTouchEvent() supported
+#define LI_FF_ADAPTIVE_BITRATE        0x04 // Host adapts the bitrate to the Frame Stats, loss summary and ping clock this library sends
 uint32_t LiGetHostFeatureFlags(void);
 
 #ifdef __cplusplus
