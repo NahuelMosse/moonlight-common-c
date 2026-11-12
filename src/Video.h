@@ -69,6 +69,25 @@ typedef struct _SS_FRAME_FEC_STATUS {
     uint8_t multiFecBlockCount;
 } SS_FRAME_FEC_STATUS, *PSS_FRAME_FEC_STATUS;
 
+// The arrival of one frame, as reported in the Frame Stats message. GameStream reserves that
+// message in every generation (packetTypes[IDX_FRAME_STATS], with its payload length) and no
+// client or host ever filled it; this is its content. From how much more spread out a frame's
+// packets arrived than they left, the host reads the width of the path even while the frames are
+// small, as in a menu.
+//
+// Times are the client's own microsecond clock truncated to 32 bits: the host only uses their
+// differences. On the wire each entry is 18 big-endian bytes, after a header with the count of
+// entries in its first byte and three reserved bytes.
+#define SS_FRAME_STATS_HEADER_SIZE 4
+#define SS_FRAME_STATS_ENTRY_SIZE 18
+typedef struct _SS_FRAME_ARRIVAL {
+    uint32_t frameIndex;
+    uint32_t firstPacketRecvTimeUs; // arrival of the first packet of the frame
+    uint32_t lastPacketRecvTimeUs;  // and of the last one
+    uint32_t bytesReceived;         // RTP bytes of every packet, parity and surplus included
+    uint16_t packetsReceived;
+} SS_FRAME_ARRIVAL, *PSS_FRAME_ARRIVAL;
+
 // Fields are little-endian
 #define SS_LTR_FRAME_ACK_PTYPE 0x0350
 typedef struct _SS_LTR_FRAME_ACK {

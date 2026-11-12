@@ -91,8 +91,12 @@ static void VideoReceiveThreadProc(void* context) {
     bool useSelect;
     int waitingForVideoMs;
     bool encrypted;
+    bool skipBehindBeforeDecrypt;
 
     encrypted = !!(EncryptionFeaturesEnabled & SS_ENC_VIDEO);
+    // Frame Stats count the parity that arrives after its frame was rebuilt, so with them every
+    // packet is decrypted and the RTP queue records its arrival before rejecting it
+    skipBehindBeforeDecrypt = !connectionReportsFrameArrival();
     decryptedSize = StreamConfig.packetSize + MAX_RTP_HEADER_SIZE;
     minSize = sizeof(RTP_PACKET) + ((EncryptionFeaturesEnabled & SS_ENC_VIDEO) ? sizeof(ENC_VIDEO_HEADER) : 0);
     receiveSize = decryptedSize + ((EncryptionFeaturesEnabled & SS_ENC_VIDEO) ? sizeof(ENC_VIDEO_HEADER) : 0);
@@ -207,7 +211,8 @@ static void VideoReceiveThreadProc(void* context) {
             // couldn't already do. If they're not on-link, we just throw their malicious
             // traffic away (as mentioned in the paragraph above) and continue accepting
             // legitmate video traffic.
-            if (encHeader->frameNumber && LE32(encHeader->frameNumber) < RtpvGetCurrentFrameNumber(&rtpQueue)) {
+            if (skipBehindBeforeDecrypt &&
+                encHeader->frameNumber && LE32(encHeader->frameNumber) < RtpvGetCurrentFrameNumber(&rtpQueue)) {
                 continue;
             }
 
